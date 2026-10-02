@@ -4,12 +4,46 @@ import requests
 import xml.etree.ElementTree as ET
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
 import plotly.graph_objects as go
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+# --- scipy 의존성을 완전히 제거한 순수 수학 정규분포 함수 ---
+def norm_cdf(x, mu=0.0, sigma=1.0):
+    """표준 오차함수를 이용한 정규분포 누적확률(CDF) 계산"""
+    return 0.5 * (1.0 + math.erf((x - mu) / (sigma * math.sqrt(2.0))))
+
+def norm_ppf(p, mu=0.0, sigma=1.0):
+    """정규분포 역함수(Quantile/PPF) 고정밀 근사 알고리즘 (Beasley-Springer-Moro)"""
+    if p <= 0.0:
+        return mu - 5.0 * sigma
+    if p >= 1.0:
+        return mu + 5.0 * sigma
+
+    a = [2.50662823884, -18.61500062529, 41.39119773534, -25.44106049637]
+    b = [-8.47351093090, 23.08336743743, -21.06224101826, 3.13082909833]
+    c = [0.3374754822726147, 0.9761690190917186, 0.1607979714918209,
+         0.02764388103300558, 0.0038405729373609, 0.0003951896511919,
+         0.0000321767881768, 0.0000002888167364, 0.0000003960315187]
+
+    y = p - 0.5
+    if abs(y) < 0.42:
+        r = y * y
+        x = y * (((a[3]*r + a[2])*r + a[1])*r + a[0]) / ((((b[3]*r + b[2])*r + b[1])*r + b[0])*r + 1.0)
+    else:
+        r = p if y < 0 else 1.0 - p
+        r = math.log(-math.log(r))
+        x = c[0] + r*(c[1] + r*(c[2] + r*(c[3] + r*(c[4] + r*(c[5] + r*(c[6] + r*(c[7] + r*c[8])))))))
+        if y < 0:
+            x = -x
+
+    return mu + sigma * x
+
+def norm_pdf(x, mu=0.0, sigma=1.0):
+    """정규분포 확률밀도함수(PDF)"""
+    return (1.0 / (sigma * math.sqrt(2.0 * math.pi))) * math.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
 # --- 웹 환경 설정 ---
 st.set_page_config(
@@ -73,14 +107,9 @@ def fetch_g2b_bid_info(bid_no_full: str):
 
 # --- 2. 발주기관 최근 개찰결과 사정율 통계 수집 ---
 def fetch_agency_history_stats(agency_name: str):
-    """
-    발주기관명을 기준으로 최근 개찰결과 15건을 조회하여 
-    평균 사정율, 최고/최저 사정율, 저가편향 비율을 계산합니다.
-    """
     if not agency_name or agency_name == "발주기관 없음":
         return None
 
-    # 개찰결과 용역 API 조회
     url = (
         "https://apis.data.go.kr/1230000/ad/OpenBiddResultInfoService/getOpengResultListInfoServc"
         f"?serviceKey={SERVICE_KEY}&pageNo=1&numOfRows=20&inqryDiv=2"
@@ -96,11 +125,10 @@ def fetch_agency_history_stats(agency_name: str):
         
         rates = []
         for item in items:
-            raw_plnd = item.findtext("plndprcRate", "").strip() # 예정가격 사정율
+            raw_plnd = item.findtext("plndprcRate", "").strip()
             if raw_plnd:
                 try:
                     val = float(raw_plnd)
-                    # 비정상 수치 필터링 (95% ~ 105% 사이만 채택)
                     if 95.0 <= val <= 105.0:
                         rates.append(val)
                 except ValueError:
@@ -109,7 +137,7 @@ def fetch_agency_history_stats(agency_name: str):
         if not rates:
             return None
 
-        rates_arr = np.array(rates[:15]) # 최근 최대 15건
+        rates_arr = np.array(rates[:15])
         return {
             "count": len(rates_arr),
             "mean": float(np.mean(rates_arr)),
@@ -129,15 +157,15 @@ def adjust_to_7(amount: float) -> int:
     else:
         return amt_ceil + (17 - remainder)
 
-# --- 4. 정규분포 곡선 및 투찰가 차트 ---
+# --- 4. 정규분포 곡선 및 차트 ---
 def build_distribution_chart(central_rate, sigma, min_rate, max_rate, peak_rate, safe_rate, att_rate, hist_mean=None):
-    x = np.linspace(min_rate - 0.005, max_rate + 0.005, 500)
-    y = norm.pdf(x, loc=central_rate, scale=sigma)
+    x_vals = np.linspace(min_rate - 0.005, max_rate + 0.005, 400)
+    y_vals = [norm_pdf(x, central_rate, sigma) for x in x_vals]
     
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
-        x=x * 100, y=y,
+        x=x_vals * 100, y=y_vals,
         mode='lines',
         name='사정율 확률분포 밀도',
         line=dict(color='#3B82F6', width=3),
@@ -152,9 +180,9 @@ def build_distribution_chart(central_rate, sigma, min_rate, max_rate, peak_rate,
     ]
 
     for label, r_val, color, size in points:
-        y_val = norm.pdf(r_val, loc=central_rate, scale=sigma)
+        y_pt = norm_pdf(r_val, central_rate, sigma)
         fig.add_trace(go.Scatter(
-            x=[r_val * 100], y=[y_val],
+            x=[r_val * 100], y=[y_pt],
             mode='markers+text',
             name=label,
             text=[f"{label}<br>{r_val*100:.3f}%"],
@@ -162,7 +190,6 @@ def build_distribution_chart(central_rate, sigma, min_rate, max_rate, peak_rate,
             marker=dict(color=color, size=size, symbol='diamond')
         ))
 
-    # 발주처 과거 평균 사정율 수직 보조선 (있을 경우)
     if hist_mean:
         fig.add_vline(
             x=hist_mean, 
@@ -343,7 +370,6 @@ if btn_search:
             if base_amt == 0:
                 st.warning("⚠️ 기초금액이 아직 공개되지 않은 공고입니다.")
             else:
-                # 하한율 판정
                 if base_amt >= 500_000_000:
                     lower_limit_rate = 0.85995
                     scale_tier = 1.1
@@ -365,11 +391,10 @@ if btn_search:
 
                 central_rate = central_rate_pct / 100.0
                 sigma = ((0.7 + (4.0 / firm_count)) * scale_tier * scale_factor) / 100.0
-                p_min = norm.cdf(min_rate, loc=central_rate, scale=sigma)
-                p_max = norm.cdf(max_rate, loc=central_rate, scale=sigma)
+                p_min = norm_cdf(min_rate, mu=central_rate, sigma=sigma)
+                p_max = norm_cdf(max_rate, mu=central_rate, sigma=sigma)
                 net_base = base_amt - val_a
 
-                # 상단 기본 공고 메트릭
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("기초금액", f"{base_amt:,.0f} 원")
                 col2.metric("사후정산 A값", f"{val_a:,.0f} 원")
@@ -378,7 +403,6 @@ if btn_search:
 
                 st.info(f"**공고명:** {bid_info['title']}  |  **발주기관:** {bid_info['agency']}")
 
-                # --- 발주처 과거 개찰결과 통계 표시부 ---
                 with st.spinner(f"'{bid_info['agency']}' 최근 개찰결과 사정율 통계 분석 중..."):
                     agency_stats = fetch_agency_history_stats(bid_info['agency'])
 
@@ -397,12 +421,11 @@ if btn_search:
                 else:
                     st.caption("ℹ️ 발주기관의 최근 용역 개찰 이력이 부족하여 기본 표준 모델로 계산합니다.")
 
-                # 1위부터 N위까지 연산
                 rows = []
                 for i in range(1, firm_count + 1):
                     p_val_raw = (i - 0.5) / firm_count
                     p_adj = p_min + p_val_raw * (p_max - p_min)
-                    target_rate = float(norm.ppf(p_adj, loc=central_rate, scale=sigma))
+                    target_rate = norm_ppf(p_adj, mu=central_rate, sigma=sigma)
                     target_rate = max(min_rate, min(max_rate, target_rate))
 
                     est_price_net = round(net_base * target_rate * lower_limit_rate)
@@ -432,7 +455,6 @@ if btn_search:
 
                 df = pd.DataFrame(rows)
 
-                # 3대 추천 카드
                 mid_idx = firm_count // 2
                 peak_pick = rows[mid_idx]
                 att_pick = rows[max(0, mid_idx - int(firm_count * 0.15))]
@@ -452,11 +474,10 @@ if btn_search:
                     st.caption(f"사정율: {att_pick['조정 사정율']:.4f}% | {att_pick['순위']}위")
 
                 with rc3:
-                    st.info("🛡️ **안정형 추천가 (낙찰 확률 방어)**")
+                    st.info("🛡️️ **안정형 추천가 (낙찰 확률 방어)**")
                     st.write(f"**금액:** `{safe_pick['실투찰금액(끝자리 7)']:,.0f} 원`")
                     st.caption(f"사정율: {safe_pick['조정 사정율']:.4f}% | {safe_pick['순위']}위")
 
-                # 차트 표시 (발주처 평균 보조선 결합)
                 chart_fig = build_distribution_chart(
                     central_rate=central_rate,
                     sigma=sigma,
@@ -471,7 +492,6 @@ if btn_search:
 
                 st.markdown("---")
 
-                # 전체 시뮬레이션 테이블 & 엑셀 다운로드
                 st.subheader(f"📊 전체 {firm_count}개 순위별 투찰 시뮬레이션")
                 
                 display_df = df.copy()
